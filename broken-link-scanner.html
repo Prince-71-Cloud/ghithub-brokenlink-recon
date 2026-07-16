@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GitHub Broken Link Scanner</title>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 900px;
+            margin: 20px auto;
+            padding: 20px;
+        }
+        .container {
+            background: #f8f8f8;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        input, button {
+            margin: 10px 0;
+            padding: 10px;
+            width: 90%;
+            box-sizing: border-box;
+        }
+        #results {
+            margin-top: 20px;
+            white-space: pre-wrap;
+            background: #fff;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #ddd;
+            min-height: 100px;
+        }
+        .status {
+            margin-top: 10px;
+            color: #555;
+            font-style: italic;
+        }
+        .result-item {
+            margin: 10px 0;
+            padding: 10px;
+            border-left: 3px solid #ccc;
+        }
+        .result-item.broken {
+            border-left-color: #f44336;
+            background-color: #ffebee;
+        }
+        .result-item.valid {
+            border-left-color: #4caf50;
+            background-color: #e8f5e9;
+        }
+        .result-item a {
+            word-break: break-all;
+        }
+        .export-btn {
+            display: inline-block;
+            margin-top: 15px;
+            padding: 10px 20px;
+            background-color: #2196F3;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .export-btn:hover {
+            background-color: #0b7dda;
+        }
+        /* Scan progress indicator */
+        #scan-progress {
+            margin-top: 10px;
+            color: #555;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>GitHub Broken Link Scanner</h1>
+        <p>⚠️ This tool requires a GitHub Personal Access Token with repo scope</p>
+
+        <div id="input-container">
+            <input type="text" id="gh-token" placeholder="GitHub Personal Access Token">
+            <br>
+            <input type="text" id="user-or-org" placeholder="Username or Organization">
+            <br>
+            <button id="start-btn">Start Scan</button>
+        </div>
+
+        <!-- Scan progress indicator -->
+        <div id="scan-progress" style="margin-top:10px;"></div>
+
+        <div id="results"></div>
+        <div class="status" id="status">Status will appear here</div>
+        <a href="#" id="export-link" class="export-btn" style="display:none;">Export Results as CSV</a>
+    </div>
+
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <script>
+        const MAX_URLS_TO_CHECK = 100; // Prevent excessive API calls
+
+        let currentTarget = '';
+        let allResults = []; // Store all results for export
+        let activeChecks = 0;
+        let isScanning = false;
+        let scanProg = document.getElementById('scan-progress');
+
+        document.getElementById('start-btn').addEventListener('click', startScan);
+
+        async function startScan() {
+            if (isScanning) {
+                if (!confirm('A scan is already in progress. Do you want to stop it and start a new one?')) {
+                    return;
+                }
+            }
+
+            isScanning = true;
+            const token = document.getElementById('gh-token').value.trim();
+            const target = document.getElementById('user-or-org').value.trim();
+
+            if (!token || !target) {
+                showStatus('Please enter both token and target');
+                isScanning = false;
+                return;
+            }
+
+            currentTarget = target;
+            allResults = [];
+            activeChecks = 0;
+            scanProg.innerHTML = 'Scanning repositories...';
+
+            showStatus('Starting scan...');
+            document.getElementById('start-btn').disabled = true;
+            document.getElementById('export-link').style.display = 'none';
+            clearResults();
+
+            try {
+                const repos = await getRepositories(token, target);
+                showStatus(`${repos.length} public repositories found`);
+
+                for (const repo of repos) {
+                    if (!isScanning) break;
+
+                    // Update progress indicator
+                    scanProg.innerHTML = `Scanning repository: ${repo.name} (${repo.stargazers_count}★)`;
+
+                    const commits = await getCommits(token, repo.full_name);
+
+                    for (const commit of commits) {
+                        if (!isScanning) break;
+
+                        if (activeChecks >= MAX_URLS_TO_CHECK) {
+                            showStatus(`Reached URL limit of ${MAX_URLS_TO_CHECK} (finishing current repo...)`);
+                            await processCommit(commit, repo.full_name);
+                            continue;
+                        }
+
+                        await processCommit(commit, repo.full_name);
+                    }
+                }
+
+                if (isScanning) {
+                    showStatus(`Scan complete! Found ${allResults.filter(r => r.broken).length} broken links out of ${allResults.length} total URLs checked.`);
+                    if (allResults.length > 0) {
+                        document.getElementById('export-link').style.display = 'inline-block';
+                    }
+                }
+            } catch (error) {
+                console.error('Scan error:', error);
+                showStatus(`Error: ${error.message || 'Unknown error'}`);
+            } finally {
+                isScanning = false;
+                document.getElementById('start-btn').disabled = false;
+            }
+        }
+
+        async function getRepositories(token, target) {
+            // Try user endpoint first
+            try {
+                const userUrl = `https://api.github.com/users/${target}/repos?type=public&per_page=100`;
+                const response = await axios.get(userUrl, {
+                    headers: { Authorization: `token ${token}` }
+                });
+                return response.data.filter(repo => !repo.private);
+            } catch (error) {
+                // If 404, try org endpoint
+                if (error.response?.status === 404) {
+                    const orgUrl = `https://api.github.com/orgs/${target}/repos?type=public&per_page=100`;
+                    const response = await axios.get(orgUrl, {
+                        headers: { Authorization: `token ${token}` }
+                    });
+                    return response.data.filter(repo => !repo.private);
+                }
+                throw error;
+            }
+        }
+
+        async function getCommits(token, repoFullName) {
+            const response = await axios.get(`https://api.github.com/repos/${repoFullName}/commits?per_page=30`, {
+                headers: { Authorization: `token ${token}` }
+            });
+            return response.data;
+        }
+
+        async function getCommitFiles(token, repoFullName, commitSha) {
+            const response = await axios.get(`https://api.github.com/repos/${repoFullName}/commits/${commitSha}`, {
+                headers: { Authorization: `token ${token}` }
+            });
+            return response.data.files || [];
+        }
+
+        async function getFileContent(token, repoFullName, filePath) {
+            try {
+                const response = await axios.get(`https://api.raw.githubusercontent.com/${repoFullName}/master/${filePath}`, {
+                    timeout: 5000
+                });
+                return response.data;
+            } catch (error) {
+                try {
+                    const response = await axios.get(`https://api.github.com/repos/${repoFullName}/contents/${filePath}`, {
+                        headers: {
+                            Authorization: `token ${token}`,
+                            Accept: 'application/vnd.github.v3.raw'
+                        }
+                    });
+                    return response.data;
+                } catch (e) {
+                    console.warn(`Could not fetch content for ${filePath}:`, e.message);
+                    return null;
+                }
+            }
+        }
+
+        async function validateUrl(url) {
+            try {
+                const response = await axios.head(url, {
+                    timeout: 8000,
+                    maxRedirects: 5,
+                    validateStatus: function(status) {
+                        return status >= 200 && status < 400;
+                    }
+                });
+                return false; // not broken
+            } catch (error) {
+                if (error.response) {
+                    return error.response.status >= 400; // broken
+                } else {
+                    return true; // network error = broken
+                }
+            }
+        }
+
+        function cleanUrl(url) {
+            return url.replace(/[.,;:!?]+$/, '').trim();
+        }
+
+        function showStatus(message) {
+            document.getElementById('status').textContent = message;
+            console.log('[Status]', message);
+        }
+
+        function clearResults() {
+            document.getElementById('results').innerHTML = '';
+        }
+
+        function displayResult(url, isBroken, repo, commit) {
+            const statusText = isBroken ? '❌ BROKEN' : '✅ VALID';
+            const statusClass = isBroken ? 'broken' : 'valid';
+            const commitShort = commit.substring(0, 7);
+
+            const resultHtml = `
+                <div class="result-item ${statusClass}">
+                    <strong>${statusText}</strong><br>
+                    <a href="${url}" target="_blank" rel="noopener">${url}</a><br>
+                    <small>Repository: ${repo} | Commit: ${commitShort}</small>
+                </div>
+            `;
+
+            document.getElementById('results').innerHTML += resultHtml;
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.scrollTop = resultsDiv.scrollHeight;
+        }
+
+        function exportResults() {
+            if (allResults.length === 0) {
+                alert('No results to export');
+                return;
+            }
+
+            let csvData = 'URL,Status,Repository,Commit\n';
+            allResults.forEach(result => {
+                csvContent += `"${result.url}","${result.broken ? 'Broken' : 'Valid"}","${result.repo}","${result.commit}"\n`;
+            });
+
+            const blob = new Blob([csvContent], {type: 'text/csv;charset=utf-8;'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            link.setAttribute('href', url);
+            link.setAttribute('download', `github_broken_links_${currentTarget}_${new Date().toISOString().slice(0,10)}.csv`);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+    </script>
+</body>
+</html>
